@@ -1,0 +1,1 @@
+{"name":"mib-gold-server","version":"1.0.0","private":true,"main":"server.js","scripts":{"start":"node server.js","test":"node test/run.js"},"engines":{"node":">=18"},"optionalDependencies":{"web-push":"^3.6.7"}}
