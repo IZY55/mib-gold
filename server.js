@@ -114,6 +114,100 @@ function createApp(o){
   const sid=ep=>crypto.createHash('sha256').update(ep).digest('hex').slice(0,24);
   const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
+  /* ---- Telegram bot (optional): set TELEGRAM_BOT_TOKEN. Alerts go to every chat that sent /start (or is listed in TELEGRAM_CHAT_ID) ---- */
+  const token=env.TELEGRAM_BOT_TOKEN||'';
+  const tg=o.tg||(token?{call:async(method,params,timeout)=>{ const c=new AbortController(),t=setTimeout(()=>c.abort(),timeout||15000);
+      try{ const r=await fetch('https://api.telegram.org/bot'+token+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(params||{}),signal:c.signal}); clearTimeout(t); const j=await r.json().catch(()=>({})); return {ok:r.ok&&j.ok!==false,status:r.status,json:j}; }
+      catch(e){ clearTimeout(t); return {ok:false,status:0,err:e.message}; } }}:null);
+  const envChats=(env.TELEGRAM_CHAT_ID||'').split(',').map(x=>x.trim()).filter(Boolean);
+  const chatDefaults=()=>({tfs:(env.TELEGRAM_TFS||'5m').split(',').filter(x=>SEC[x]),buy:true,sell:true,offset:0,tz:0});
+  const tgState=()=>{ const st=store.state; st.tg=st.tg||{chats:{}}; st.tg.chats=st.tg.chats||{}; envChats.forEach(id=>{ if(!st.tg.chats[id]) st.tg.chats[id]=chatDefaults(); }); return st.tg; };
+  const lastClose={};
+  const pad=n=>String(n).padStart(2,'0');
+  function tgTime(ms,tz){ const d=new Date(ms+tz*3600000); return d.getUTCDate()+' '+['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()]+' '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+' (UTC'+(tz>=0?'+':'')+tz+')'; }
+  function tgText(sg,c){
+    const off=Number.isFinite(c.offset)?c.offset:0,f=v=>(v+off).toFixed(2),B=sg.dir>0?'BUY':'SELL';
+    return (sg.dir>0?'🟢 ':'🔴 ')+B+' CONFIRMED — XAUUSD '+sg.tf.toUpperCase().replace(/^(\d+)M$/,'M$1')+'\nEntry: '+f(sg.entry)+'\nStop-loss: '+f(sg.sl)+'\nTake-profit: '+(sg.tp!=null?f(sg.tp)+' (live MSS exit)':'live — exits at the first opposite MSS (none set yet)')+'\nSignal time: '+tgTime(sg.t,c.tz||0);
+  }
+  async function tgSend(chatId,text){
+    const delays=o.retryDelays||[1500,5000];
+    for(let a=0;a<=delays.length;a++){
+      const r=await tg.call('sendMessage',{chat_id:chatId,text,disable_web_page_preview:true});
+      if(r.ok) return 'ok';
+      if(r.status===403||r.status===400&&/chat not found|blocked/i.test(JSON.stringify(r.json||''))){ delete tgState().chats[chatId]; store.save(); say('telegram chat removed'); return 'removed'; }
+      if(a<delays.length) await sleep(r.status===429?Math.min(10000,((r.json&&r.json.parameters&&r.json.parameters.retry_after)||2)*1000):delays[a]); else say('telegram send failed '+(r.status||r.err));
+    }
+    return 'failed';
+  }
+  async function tgBroadcast(sg){
+    if(!tg) return 0; let n=0;
+    if(!(Number.isFinite(sg.entry)&&Number.isFinite(sg.sl)&&(sg.dir>0?sg.sl<sg.entry:sg.sl>sg.entry))) return 0;
+    for(const [id,c] of Object.entries(tgState().chats)){
+      if(!(sg.dir>0?c.buy:c.sell)||!(c.tfs||[]).includes(sg.tf)) continue;
+      if(await tgSend(id,tgText(sg,c))==='ok') n++;
+    }
+    return n;
+  }
+  /* ---- ntfy (optional, no account): set NTFY_TOPIC to a long secret word; install the free ntfy app and subscribe to the same topic ---- */
+  const topic=(env.NTFY_TOPIC||'').trim(),ntfyBase=(env.NTFY_SERVER||'https://ntfy.sh').replace(/\/+$/,'');
+  const ntfyOK=/^[A-Za-z0-9_-]{8,64}$/.test(topic),ntfyPost=o.ntfyPost||(async body=>{ const c=new AbortController(),t=setTimeout(()=>c.abort(),12000);
+    try{ const r=await fetch(ntfyBase,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:c.signal}); clearTimeout(t); return {ok:r.ok,status:r.status}; }catch(e){ clearTimeout(t); return {ok:false,status:0,err:e.message}; } });
+  const ntfyState=()=>{ const st=store.state; st.ntfy=st.ntfy||{offset:0}; return st.ntfy; };
+  const ntfyCfg=()=>({offset:ntfyState().offset||0,tz:Number.isFinite(+env.NTFY_TZ)?+env.NTFY_TZ:0});
+  async function ntfySend(title,message){
+    const delays=o.retryDelays||[1500,5000];
+    for(let a=0;a<=delays.length;a++){
+      const r=await ntfyPost({topic,title,message,priority:4,tags:['chart_with_upwards_trend']});
+      if(r.ok) return 'ok'; if(r.status===400||r.status===401||r.status===403){ say('ntfy rejected '+r.status); return 'rejected'; }
+      if(a<delays.length) await sleep(delays[a]); else say('ntfy send failed '+(r.status||r.err));
+    }
+    return 'failed';
+  }
+  async function ntfyBroadcast(sg){
+    if(!ntfyOK) return 0;
+    if(!(Number.isFinite(sg.entry)&&Number.isFinite(sg.sl)&&(sg.dir>0?sg.sl<sg.entry:sg.sl>sg.entry))) return 0;
+    const tfs=(env.NTFY_TFS||'5m').split(',');
+    if(!tfs.includes(sg.tf)||(sg.dir>0&&env.NTFY_BUY==='off')||(sg.dir<0&&env.NTFY_SELL==='off')) return 0;
+    const lines=tgText(sg,ntfyCfg()).split('\n');
+    return (await ntfySend(lines[0],lines.slice(1).join('\n')))==='ok'?1:0;
+  }
+  const HELP='MIB Gold alerts\n/tf 5m 15m — timeframes (1m 5m 15m 30m)\n/buy on|off · /sell on|off\n/sync 4036.5 — type your MT5 price so alerts match MT5\n/tz 1 — your time zone offset (Lagos = 1)\n/status · /test · /stop';
+  async function tgCommand(msg){
+    const id=String(msg.chat.id),text=(msg.text||'').trim(),[cmd0,...args]=text.split(/\s+/),cmd=(cmd0||'').split('@')[0].toLowerCase();
+    const reply=t=>tg.call('sendMessage',{chat_id:id,text:t});
+    if(cmd==='/id') return reply('Your chat id: '+id+(envChats.length&&!envChats.includes(id)?'\n(not authorised on this server)':''));
+    if(envChats.length&&!envChats.includes(id)) return;                      // private server: only listed chats may use it
+    const st=tgState(),c=st.chats[id];
+    if(cmd==='/start'){ if(!c){ st.chats[id]=chatDefaults(); store.save(); } return reply('✅ Alerts on. You will get NEW CONFIRMED XAUUSD signals only (never developing ones).\nChat id: '+id+'\n\n'+HELP+'\n\nTip: set TELEGRAM_CHAT_ID='+id+' on the server so this survives restarts.'); }
+    if(!c) return reply('Send /start first.');
+    if(cmd==='/stop'){ delete st.chats[id]; store.save(); return reply('Alerts stopped. Send /start to turn them on again.'); }
+    if(cmd==='/tf'){ const t=args.map(x=>x.toLowerCase()).filter(x=>SEC[x]); if(!t.length) return reply('Use: /tf 5m 15m (choices: 1m 5m 15m 30m)'); c.tfs=[...new Set(t)]; store.save(); return reply('Timeframes: '+c.tfs.join(', ')); }
+    if(cmd==='/buy'||cmd==='/sell'){ const v=(args[0]||'').toLowerCase(); if(v!=='on'&&v!=='off') return reply('Use: '+cmd+' on  or  '+cmd+' off'); c[cmd.slice(1)]=v==='on'; store.save(); return reply(cmd.slice(1).toUpperCase()+' alerts '+v.toUpperCase()); }
+    if(cmd==='/tz'){ const z=parseFloat(args[0]); if(!Number.isFinite(z)||Math.abs(z)>14) return reply('Use: /tz 1  (hours from UTC)'); c.tz=z; store.save(); return reply('Time zone UTC'+(z>=0?'+':'')+z); }
+    if(cmd==='/sync'){
+      const px=parseFloat(args[0]),tfk=Object.keys(lastClose).find(k=>feed[k]&&feed[k].state==='LIVE');
+      if(args[0]&&['reset','0'].includes(args[0].toLowerCase())){ c.offset=0; store.save(); return reply('Price sync cleared.'); }
+      if(!Number.isFinite(px)||px<=0) return reply('Use: /sync 4036.50  (the gold price you see in MT5 right now)');
+      if(!tfk) return reply('Market data is not live right now, try again in a minute.');
+      c.offset=px-lastClose[tfk]; store.save(); return reply('Synced. Alerts will now use your MT5 price scale (offset '+(c.offset>=0?'+':'')+c.offset.toFixed(2)+').');
+    }
+    if(cmd==='/status') return reply('Feed: '+tfs.map(t=>t+' '+feed[t].state).join(' · ')+'\nTimeframes: '+c.tfs.join(', ')+'\nBUY '+(c.buy?'on':'off')+' · SELL '+(c.sell?'on':'off')+'\nOffset: '+(c.offset||0).toFixed(2)+' · UTC'+((c.tz||0)>=0?'+':'')+(c.tz||0));
+    if(cmd==='/test') return reply('🧪 TEST ONLY — not a trading signal. Telegram alerts are working. No entry, stop-loss or take-profit here.');
+    return reply(HELP);
+  }
+  let tgOff=0,tgRun=false;
+  async function tgPoll(){
+    if(!tg||tgRun) return; tgRun=true;
+    await tg.call('deleteWebhook',{});
+    while(tgRun){
+      const r=await tg.call('getUpdates',{offset:tgOff,timeout:25,allowed_updates:['message']},35000);
+      if(!r.ok){ await sleep(o.tgErrorDelay||5000); continue; }
+      for(const u of (r.json&&r.json.result)||[]){ tgOff=u.update_id+1; try{ if(u.message&&u.message.chat&&u.message.text) await tgCommand(u.message); }catch(e){ say('telegram command error '+e.message); } }
+      if(o.tgOnce) break;
+    }
+    tgRun=false;
+  }
+
   async function deliver(id,payload){          // retries transient failures, drops dead subscriptions
     const s=store.state.subs[id]; if(!s) return 'gone';
     const delays=o.retryDelays||[1500,5000];
@@ -135,13 +229,14 @@ function createApp(o){
       if(!(Number.isFinite(pl.entry)&&Number.isFinite(pl.sl)&&(pl.dir>0?pl.sl<pl.entry:pl.sl>pl.entry))){ say('invalid signal values, not sent'); continue; }
       if(await deliver(id,pl)==='ok') sent++;
     }
+    sent+=await tgBroadcast(sg); sent+=await ntfyBroadcast(sg);
     sg.sent=sent; return sent;
   }
   async function processTf(tf){
     const f=feed[tf],sec=SEC[tf];
     let c; try{ c=await fetchKlines(tf); const bad=validateCandles(c); if(bad) throw new Error(bad); }
     catch(e){ f.err=e.message; f.state=(now()-f.lastOk>Math.max(120000,sec*2000))?'OFFLINE':'STALE'; f.why='data fetch failed: '+e.message; return; }
-    f.err=''; const h=feedHealth(c,tf,now()); f.state=h.state; f.why=h.why; f.lastOk=now(); f.lastT=c[c.length-1].t;
+    f.err=''; lastClose[tf]=c[c.length-1].close; const h=feedHealth(c,tf,now()); f.state=h.state; f.why=h.why; f.lastOk=now(); f.lastT=c[c.length-1].t;
     if(h.state!=='LIVE') return;                                   // never generate signals from stale or incomplete data
     const n=c.length,key=c[n-2].t; if(f.lastScanKey===key) return; f.lastScanKey=key;
     const sigs=engine.scanSignals(c);                              // same code as the chart; each bar only uses data up to itself
@@ -157,8 +252,8 @@ function createApp(o){
     }
   }
   let timers=[];
-  function start(){ tfs.forEach((tf,i)=>{ let run=false; const go=async()=>{ if(run) return; run=true; try{ await processTf(tf); }catch(e){ say('loop error '+e.message); } run=false; }; timers.push(setTimeout(()=>{ go(); timers.push(setInterval(go,+(env.POLL_MS||10000))); },i*1500)); }); }
-  function stop(){ timers.forEach(t=>{clearTimeout(t);clearInterval(t);}); timers=[]; }
+  function start(){ tgPoll(); tfs.forEach((tf,i)=>{ let run=false; const go=async()=>{ if(run) return; run=true; try{ await processTf(tf); }catch(e){ say('loop error '+e.message); } run=false; }; timers.push(setTimeout(()=>{ go(); timers.push(setInterval(go,+(env.POLL_MS||10000))); },i*1500)); }); }
+  function stop(){ tgRun=false; timers.forEach(t=>{clearTimeout(t);clearInterval(t);}); timers=[]; }
   const headline=()=>feed[feed['5m']?'5m':tfs[0]];
 
   /* ---- HTTP ---- */
@@ -176,9 +271,18 @@ function createApp(o){
     if(p.startsWith('/api/')&&p!=='/api/health'&&limited(ip)) return J(res,429,{error:'slow down'});
     try{
       if(STATIC[p]&&req.method==='GET'){ const f=STATIC[p],buf=fs.readFileSync(path.join(__dirname,f)); res.writeHead(200,{'Content-Type':MIME[f.split('.').pop()]||'application/octet-stream','Cache-Control':f==='sw.js'||f==='index.html'?'no-cache':'public, max-age=3600'}); return res.end(buf); }
-      if(p==='/api/health') return J(res,200,{ok:true,uptime:Math.round(process.uptime()),subs:Object.keys(store.state.subs).length,feed:Object.fromEntries(tfs.map(t=>[t,{state:feed[t].state,why:feed[t].why,lastCandle:feed[t].lastT||null}])),ephemeralKeys:ephemeral});
+      if(p==='/api/health') return J(res,200,{ok:true,uptime:Math.round(process.uptime()),subs:Object.keys(store.state.subs).length,feed:Object.fromEntries(tfs.map(t=>[t,{state:feed[t].state,why:feed[t].why,lastCandle:feed[t].lastT||null}])),ephemeralKeys:ephemeral,telegram:!!tg,telegramChats:tg?Object.keys(tgState().chats).length:0,ntfy:ntfyOK});
       if(p==='/api/vapid') return J(res,200,{key:vapid.pub,feed:{state:headline().state,why:headline().why}});
       if(p==='/api/signals') return J(res,200,{signals:signals.map(s=>({id:s.id,tf:s.tf,dir:s.dir,t:s.t,sent:s.sent,late:!!s.late})),log:log.slice(-20)});
+      if(p==='/api/ntfy-test'||p==='/api/sync'){      // the secret topic acts as the password
+        if(!ntfyOK||u.searchParams.get('topic')!==topic) return J(res,403,{error:'wrong topic'});
+        if(p==='/api/ntfy-test'){ const r=await ntfySend('🧪 TEST ONLY — not a trading signal','ntfy alerts are working. No entry, stop-loss or take-profit here.'); return J(res,r==='ok'?200:502,{ok:r==='ok'}); }
+        const px=parseFloat(u.searchParams.get('price')),k=Object.keys(lastClose).find(t=>feed[t]&&feed[t].state==='LIVE');
+        if(u.searchParams.get('price')==='reset'){ ntfyState().offset=0; store.save(); return J(res,200,{ok:true,offset:0}); }
+        if(!Number.isFinite(px)||px<=0) return J(res,400,{error:'use price=4036.5'});
+        if(!k) return J(res,503,{error:'market data not live right now'});
+        ntfyState().offset=px-lastClose[k]; store.save(); return J(res,200,{ok:true,offset:+ntfyState().offset.toFixed(2)});
+      }
       if(p==='/api/subscribe'&&req.method==='POST'){
         const b=await readBody(req); if(!validSub(b.subscription)) return J(res,400,{error:'invalid subscription'});
         const id=sid(b.subscription.endpoint),cur=store.state.subs[id];
@@ -197,7 +301,7 @@ function createApp(o){
       J(res,404,{error:'not found'});
     }catch(e){ J(res,400,{error:e.message}); }
   };
-  return {handler,start,stop,feed,signals,store,vapid,processTf,deliver,broadcast,log};
+  return {handler,start,stop,feed,signals,store,vapid,processTf,deliver,broadcast,log,tgCommand,tgPoll,tgText};
 }
 
 module.exports={createApp,loadEngine,makeStore,makeFeed,vapidFromSeed,vapidJWT,encryptPayload,validateCandles,feedHealth,SEC};
